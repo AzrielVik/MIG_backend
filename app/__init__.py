@@ -1,5 +1,5 @@
 from flask import Flask
-from .extensions import db, migrate
+from app.extensions import db, migrate
 
 def create_app():
     app = Flask(__name__)
@@ -8,12 +8,13 @@ def create_app():
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
     db.init_app(app)
-    migrate.init_app(app, db) 
+    migrate.init_app(app, db)
 
-    # IMPORTANT: load models
+    # load models so Alembic can see them
     from app.models import models
 
-    with app.app_context():
-        db.create_all()
+    # register routes blueprint
+    from app.routes import routes
+    app.register_blueprint(routes)
 
     return app
