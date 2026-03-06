@@ -2,49 +2,104 @@ from flask import Blueprint, request, jsonify
 from app.extensions import db
 from app.models.models import User, Room, Guest, Booking
 from datetime import datetime, timedelta
+from sqlalchemy.exc import IntegrityError
+from werkzeug.security import generate_password_hash, check_password_hash
+
 
 routes = Blueprint('routes', __name__)
 
-# ---------------------
 # USERS
 # ---------------------
+
 @routes.route("/users", methods=["POST"])
 def create_user():
     data = request.json
+
     if not data.get("username") or not data.get("email") or not data.get("password"):
-        return jsonify({"error": "username, email, and password required"}), 400
+        return jsonify({
+            "error": "username, email, and password required"
+        }), 400
+
+    # Pre-check for better UX
+    existing_user = User.query.filter(
+        (User.username == data["username"]) |
+        (User.email == data["email"])
+    ).first()
+
+    if existing_user:
+        return jsonify({
+            "error": "User already exists",
+            "details": "Username or email already in use"
+        }), 409
+
     user = User(
         username=data["username"],
-        email=data["email"],
-        password=data["password"]  # will hash later when integrating auth
+        email=data["email"]
     )
-    db.session.add(user)
-    db.session.commit()
-    return jsonify({"message": "User created", "id": user.id}), 201
+
+    # 🔐 HASH PASSWORD HERE
+    user.set_password(data["password"])
+
+    try:
+        db.session.add(user)
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({
+            "error": "User already exists",
+            "details": "Username or email already in use"
+        }), 409
+
+    return jsonify({
+        "message": "User created",
+        "id": user.id
+    }), 201
 
 
 @routes.route("/users", methods=["GET"])
 def get_users():
     users = User.query.all()
     return jsonify([
-        {"id": u.id, "username": u.username, "email": u.email} for u in users
-    ])
+        {
+            "id": u.id,
+            "username": u.username,
+            "email": u.email
+        } for u in users
+    ]), 200
 
 
 @routes.route("/users/<int:user_id>", methods=["GET"])
 def get_user(user_id):
     user = User.query.get_or_404(user_id)
-    return jsonify({"id": user.id, "username": user.username, "email": user.email})
+    return jsonify({
+        "id": user.id,
+        "username": user.username,
+        "email": user.email
+    }), 200
 
 
 @routes.route("/users/<int:user_id>", methods=["PUT"])
 def update_user(user_id):
     user = User.query.get_or_404(user_id)
     data = request.json
+
     user.username = data.get("username", user.username)
     user.email = data.get("email", user.email)
-    db.session.commit()
-    return jsonify({"message": "User updated"})
+
+    # Optional: allow password update
+    if data.get("password"):
+        user.set_password(data["password"])
+
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({
+            "error": "Update failed",
+            "details": "Username or email already in use"
+        }), 409
+
+    return jsonify({"message": "User updated"}), 200
 
 
 @routes.route("/users/<int:user_id>", methods=["DELETE"])
@@ -52,7 +107,7 @@ def delete_user(user_id):
     user = User.query.get_or_404(user_id)
     db.session.delete(user)
     db.session.commit()
-    return jsonify({"message": "User deleted"})
+    return jsonify({"message": "User deleted"}), 200
 
 
 # ---------------------
