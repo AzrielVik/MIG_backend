@@ -6,9 +6,12 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    # Added password field to match database constraint
     password = db.Column(db.String(200), nullable=False) 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_password(self, password):
+        # Placeholder for password hashing logic
+        self.password = password
 
     def __repr__(self):
         return f"<User {self.username}>"
@@ -18,10 +21,14 @@ class User(db.Model):
 class Room(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     number = db.Column(db.String(10), unique=True, nullable=False)
-    room_type = db.Column(db.String(50), nullable=False)  # single, double, etc
+    room_type = db.Column(db.String(50), nullable=False)  # Deluxe Room, Standard, etc.
+    
+    # NEW FIELDS: For the Room Cards UI
+    capacity = db.Column(db.Integer, default=2) # e.g., "2 Guests"
+    beds = db.Column(db.Integer, default=1)     # e.g., "1 Bed"
 
-    # status options: free | booked | cleaning
-    status = db.Column(db.String(20), default="free")
+    # Standardized status: Available | Occupied | Cleaning
+    status = db.Column(db.String(20), default="Available")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     bookings = db.relationship("Booking", backref="room", lazy=True)
@@ -38,7 +45,9 @@ class Guest(db.Model):
     phone_number = db.Column(db.String(20), nullable=True)
     vehicle_registration = db.Column(db.String(30), nullable=True)
     num_people = db.Column(db.Integer, default=1)
+    
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    check_out = db.Column(db.String(100), nullable=True)
 
     bookings = db.relationship("Booking", backref="guest", lazy=True)
 
@@ -52,9 +61,7 @@ class Booking(db.Model):
     guest_id = db.Column(db.Integer, db.ForeignKey("guest.id"), nullable=False)
     room_id = db.Column(db.Integer, db.ForeignKey("room.id"), nullable=False)
 
-    # Automatically set when receptionist clicks "Check In"
     checkin_time = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    # Set only when receptionist clicks "Check Out"
     checkout_time = db.Column(db.DateTime, nullable=True)
 
     days_staying = db.Column(db.Integer, nullable=False)

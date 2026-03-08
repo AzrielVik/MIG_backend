@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from app.extensions import db
 from app.models.models import User, Room, Guest, Booking
 from datetime import datetime, timedelta
+
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -111,17 +112,35 @@ def delete_user(user_id):
 
 
 # ---------------------
-# ROOMS
+# ROOMS & STATISTICS
 # ---------------------
+
+@routes.route("/rooms/stats", methods=["GET"])
+def get_room_stats():
+    """
+    Returns counts for the three summary cards at the top of the Rooms screen.
+    Matches the 'Available', 'Occupied', and 'Maintenance/Cleaning' cards.
+    """
+    return jsonify({
+        "available": Room.query.filter_by(status="Available").count(),
+        "occupied": Room.query.filter_by(status="Occupied").count(),
+        "cleaning": Room.query.filter_by(status="Cleaning").count()
+    }), 200
+
+
 @routes.route("/rooms", methods=["POST"])
 def create_room():
     data = request.json
     if not data.get("number") or not data.get("room_type"):
         return jsonify({"error": "number and room_type required"}), 400
+    
+    # Updated to include capacity and beds for the new UI cards
     room = Room(
         number=data["number"],
         room_type=data["room_type"],
-        status=data.get("status", "free")
+        capacity=data.get("capacity", 2), # Default to 2 Guests
+        beds=data.get("beds", 1),         # Default to 1 Bed
+        status=data.get("status", "Available")
     )
     db.session.add(room)
     db.session.commit()
@@ -134,11 +153,20 @@ def get_rooms():
     query = Room.query
     if status_filter:
         query = query.filter_by(status=status_filter)
+    
     rooms = query.all()
+    # Now returns capacity and beds so Flutter can show '2 Guests | 1 Bed'
     return jsonify([
-        {"id": r.id, "number": r.number, "room_type": r.room_type, "status": r.status}
+        {
+            "id": r.id, 
+            "number": r.number, 
+            "room_type": r.room_type, 
+            "status": r.status,
+            "capacity": r.capacity,
+            "beds": r.beds
+        }
         for r in rooms
-    ])
+    ]), 200
 
 
 @routes.route("/rooms/<int:room_id>", methods=["GET"])
@@ -148,17 +176,20 @@ def get_room(room_id):
         "id": room.id,
         "number": room.number,
         "room_type": room.room_type,
-        "status": room.status
-    })
+        "status": room.status,
+        "capacity": room.capacity,
+        "beds": room.beds
+    }), 200
 
 
 @routes.route("/rooms/<int:room_id>/status", methods=["PUT"])
 def update_room_status(room_id):
     room = Room.query.get_or_404(room_id)
     data = request.json
+    # Expected statuses: Available | Occupied | Cleaning
     room.status = data.get("status", room.status)
     db.session.commit()
-    return jsonify({"message": "Room status updated"})
+    return jsonify({"message": f"Room {room.number} status updated to {room.status}"}), 200
 
 
 @routes.route("/rooms/<int:room_id>", methods=["PUT"])
@@ -168,8 +199,10 @@ def update_room(room_id):
     room.number = data.get("number", room.number)
     room.room_type = data.get("room_type", room.room_type)
     room.status = data.get("status", room.status)
+    room.capacity = data.get("capacity", room.capacity)
+    room.beds = data.get("beds", room.beds)
     db.session.commit()
-    return jsonify({"message": "Room updated"})
+    return jsonify({"message": "Room updated"}), 200
 
 
 @routes.route("/rooms/<int:room_id>", methods=["DELETE"])
@@ -177,17 +210,19 @@ def delete_room(room_id):
     room = Room.query.get_or_404(room_id)
     db.session.delete(room)
     db.session.commit()
-    return jsonify({"message": "Room deleted"})
+    return jsonify({"message": "Room deleted"}), 200
 
 
 # ---------------------
-# GUESTS
+# GUESTS 
 # ---------------------
+
 @routes.route("/guests", methods=["POST"])
 def create_guest():
     data = request.json
     if not data.get("full_name") or not data.get("id_number"):
         return jsonify({"error": "full_name and id_number required"}), 400
+    
     guest = Guest(
         full_name=data["full_name"],
         id_number=data["id_number"],
@@ -199,63 +234,109 @@ def create_guest():
     db.session.commit()
     return jsonify({"message": "Guest created", "id": guest.id}), 201
 
-
 @routes.route("/guests", methods=["GET"])
 def get_guests():
-    guests = Guest.query.all()
-    return jsonify([
-        {
+    # Supports date filtering, period filtering (weekly), and ID searching
+    filter_date = request.args.get('date')
+    period = request.args.get('period')
+    id_number = request.args.get('id_number')
+    
+    query = Guest.query
+
+    # 1. Filter by specific ID if searching
+    if id_number:
+        query = query.filter(Guest.id_number.ilike(f"%{id_number}%"))
+
+    # 2. Filter by specific calendar date
+    if filter_date:
+        try:
+            start_day = datetime.strptime(filter_date, '%Y-%m-%d')
+            query = query.filter(
+                Guest.created_at >= start_day,
+                Guest.created_at < start_day + timedelta(days=1)
+            )
+        except ValueError:
+            return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+            
+    # 3. Filter by period (e.g., 'weekly' view)
+    elif period == 'weekly':
+        one_week_ago = datetime.utcnow() - timedelta(days=7)
+        query = query.filter(Guest.created_at >= one_week_ago)
+
+    # Order by newest registration first
+    guests = query.order_by(Guest.created_at.desc()).all()
+
+    results = []
+    for g in guests:
+        # Link the guest to their most recent room assignment
+        active_booking = Booking.query.filter_by(guest_id=g.id).order_by(Booking.created_at.desc()).first()
+        
+        results.append({
             "id": g.id,
             "full_name": g.full_name,
             "id_number": g.id_number,
             "phone_number": g.phone_number,
-            "vehicle_registration": g.vehicle_registration
-        }
-        for g in guests
-    ])
-
+            "vehicle_registration": g.vehicle_registration,
+            "num_people": g.num_people,
+            "created_at": g.created_at.isoformat() if g.created_at else None,
+            "check_out": g.check_out,
+            "room_number": active_booking.room.number if active_booking else "No Room" # Matches Vercel mock
+        })
+        
+    return jsonify(results), 200
 
 @routes.route("/guests/<int:guest_id>", methods=["GET"])
 def get_guest(guest_id):
     g = Guest.query.get_or_404(guest_id)
+    # Fetch room info for the specific guest details view
+    active_booking = Booking.query.filter_by(guest_id=g.id).order_by(Booking.created_at.desc()).first()
+    
     return jsonify({
         "id": g.id,
         "full_name": g.full_name,
         "id_number": g.id_number,
         "phone_number": g.phone_number,
-        "vehicle_registration": g.vehicle_registration
-    })
-
+        "vehicle_registration": g.vehicle_registration,
+        "num_people": g.num_people,
+        "created_at": g.created_at.isoformat() if g.created_at else None,
+        "check_out": g.check_out,
+        "room_number": active_booking.room.number if active_booking else "No Room"
+    }), 200
 
 @routes.route("/guests/<int:guest_id>", methods=["PUT"])
 def update_guest(guest_id):
     g = Guest.query.get_or_404(guest_id)
     data = request.json
+    
     g.full_name = data.get("full_name", g.full_name)
     g.id_number = data.get("id_number", g.id_number)
     g.phone_number = data.get("phone_number", g.phone_number)
     g.vehicle_registration = data.get("vehicle_registration", g.vehicle_registration)
     g.num_people = data.get("num_people", g.num_people)
+    
+    if "check_out" in data:
+        g.check_out = data["check_out"]
+        
     db.session.commit()
-    return jsonify({"message": "Guest updated"})
-
+    return jsonify({"message": "Guest updated"}), 200
 
 @routes.route("/guests/<int:guest_id>", methods=["DELETE"])
 def delete_guest(guest_id):
     g = Guest.query.get_or_404(guest_id)
     db.session.delete(g)
     db.session.commit()
-    return jsonify({"message": "Guest deleted"})
-
-
+    return jsonify({"message": "Guest deleted"}), 200
 # ---------------------
-# BOOKINGS
+# BOOKINGS (Linking Guests to Rooms)
 # ---------------------
+
 def is_room_available(room_id, checkin_date, days_staying):
+    """Checks if a room is available for the given date range"""
     checkin = datetime.strptime(checkin_date, "%Y-%m-%d")
     checkout = checkin + timedelta(days=days_staying)
     bookings = Booking.query.filter_by(room_id=room_id).all()
     for b in bookings:
+        # Use existing checkin_time and calculate checkout if not set
         b_checkin = b.checkin_time
         b_checkout = b.checkout_time or (b.checkin_time + timedelta(days=b.days_staying))
         if not (checkout <= b_checkin or checkin >= b_checkout):
@@ -274,6 +355,10 @@ def create_booking():
     if not days_staying or days_staying <= 0:
         return jsonify({"error": "Invalid days_staying"}), 400
 
+    # Ensure the room is physically 'Available' before booking
+    if room.status != "Available":
+        return jsonify({"error": f"Room {room.number} is currently {room.status} and cannot be booked"}), 400
+
     if not is_room_available(room.id, checkin_date, days_staying):
         return jsonify({"error": "Room not available for selected dates"}), 400
 
@@ -285,11 +370,13 @@ def create_booking():
         amount_paid=data.get("amount_paid", 0.0),
         checkin_time=datetime.strptime(checkin_date, "%Y-%m-%d")
     )
-    room.status = "booked"
+    
+    # AUTO-FLIP: Mark room as Occupied upon booking
+    room.status = "Occupied"
 
     db.session.add(booking)
     db.session.commit()
-    return jsonify({"message": "Booking created", "id": booking.id}), 201
+    return jsonify({"message": "Booking created", "id": booking.id, "room_status": room.status}), 201
 
 
 @routes.route("/bookings", methods=["GET"])
@@ -300,14 +387,14 @@ def get_bookings():
             "id": b.id,
             "guest": b.guest.full_name,
             "room": b.room.number,
-            "checkin_time": b.checkin_time,
-            "checkout_time": b.checkout_time,
+            "checkin_time": b.checkin_time.isoformat() if b.checkin_time else None,
+            "checkout_time": b.checkout_time.isoformat() if b.checkout_time else None,
             "days_staying": b.days_staying,
             "paid": b.paid,
             "amount_paid": b.amount_paid
         }
         for b in bookings
-    ])
+    ]), 200
 
 
 @routes.route("/bookings/<int:booking_id>", methods=["GET"])
@@ -317,33 +404,33 @@ def get_booking(booking_id):
         "id": b.id,
         "guest": b.guest.full_name,
         "room": b.room.number,
-        "checkin_time": b.checkin_time,
-        "checkout_time": b.checkout_time,
+        "checkin_time": b.checkin_time.isoformat() if b.checkin_time else None,
+        "checkout_time": b.checkout_time.isoformat() if b.checkout_time else None,
         "days_staying": b.days_staying,
         "paid": b.paid,
         "amount_paid": b.amount_paid
-    })
+    }), 200
 
 
 @routes.route("/bookings/<int:booking_id>", methods=["PUT"])
 def update_booking(booking_id):
     b = Booking.query.get_or_404(booking_id)
     data = request.json
-    # allow update of days_staying, paid, amount_paid
     b.days_staying = data.get("days_staying", b.days_staying)
     b.paid = data.get("paid", b.paid)
     b.amount_paid = data.get("amount_paid", b.amount_paid)
     db.session.commit()
-    return jsonify({"message": "Booking updated"})
+    return jsonify({"message": "Booking updated"}), 200
 
 
 @routes.route("/bookings/<int:booking_id>", methods=["DELETE"])
 def delete_booking(booking_id):
     b = Booking.query.get_or_404(booking_id)
-    b.room.status = "free"
+    # Reset room to Available if the booking is deleted
+    b.room.status = "Available"
     db.session.delete(b)
     db.session.commit()
-    return jsonify({"message": "Booking deleted"})
+    return jsonify({"message": "Booking deleted", "room_status": "Available"}), 200
 
 
 @routes.route("/bookings/<int:booking_id>/checkout", methods=["PUT"])
@@ -351,7 +438,15 @@ def checkout(booking_id):
     b = Booking.query.get_or_404(booking_id)
     if b.checkout_time is not None:
         return jsonify({"error": "Already checked out"}), 400
+    
     b.checkout_time = datetime.utcnow()
-    b.room.status = "free"
+    
+    # AUTO-FLIP: Set room to Cleaning after a guest leaves
+    b.room.status = "Cleaning"
+    
     db.session.commit()
-    return jsonify({"message": "Checked out successfully"})
+    return jsonify({
+        "message": "Checked out successfully", 
+        "checkout_time": b.checkout_time.isoformat(),
+        "room_status": "Cleaning"
+    }), 200
