@@ -112,14 +112,13 @@ def delete_user(user_id):
 
 
 # ---------------------
-# ROOMS & STATISTICS
-# ---------------------
+# --- ROOMS & STATISTICS ---
 
 @routes.route("/rooms/stats", methods=["GET"])
 def get_room_stats():
     """
     Returns counts for the three summary cards at the top of the Rooms screen.
-    Matches the 'Available', 'Occupied', and 'Maintenance/Cleaning' cards.
+    Matches the 'Available', 'Occupied', and 'Cleaning' cards.
     """
     return jsonify({
         "available": Room.query.filter_by(status="Available").count(),
@@ -134,12 +133,11 @@ def create_room():
     if not data.get("number") or not data.get("room_type"):
         return jsonify({"error": "number and room_type required"}), 400
     
-    # Updated to include capacity and beds for the new UI cards
     room = Room(
         number=data["number"],
         room_type=data["room_type"],
-        capacity=data.get("capacity", 2), # Default to 2 Guests
-        beds=data.get("beds", 1),         # Default to 1 Bed
+        capacity=data.get("capacity", 2),
+        beds=data.get("beds", 1),
         status=data.get("status", "Available")
     )
     db.session.add(room)
@@ -155,30 +153,43 @@ def get_rooms():
         query = query.filter_by(status=status_filter)
     
     rooms = query.all()
-    # Now returns capacity and beds so Flutter can show '2 Guests | 1 Bed'
-    return jsonify([
-        {
+    results = []
+    
+    for r in rooms:
+        # FIXED: Look for the active guest assigned to this room
+        # We find a booking where checkout_time is still null
+        active_booking = Booking.query.filter_by(room_id=r.id, checkout_time=None).first()
+        
+        results.append({
             "id": r.id, 
             "number": r.number, 
             "room_type": r.room_type, 
             "status": r.status,
             "capacity": r.capacity,
-            "beds": r.beds
-        }
-        for r in rooms
-    ]), 200
+            "beds": r.beds,
+            # These fields fix the "N/A" issue in your Flutter UI
+            "current_guest_name": active_booking.guest.full_name if active_booking and active_booking.guest else None,
+            "current_guest_phone": active_booking.guest.phone_number if active_booking and active_booking.guest else None
+        })
+        
+    return jsonify(results), 200
 
 
 @routes.route("/rooms/<int:room_id>", methods=["GET"])
 def get_room(room_id):
-    room = Room.query.get_or_404(room_id)
+    r = Room.query.get_or_404(room_id)
+    # Also include occupant info for individual room lookups
+    active_booking = Booking.query.filter_by(room_id=r.id, checkout_time=None).first()
+    
     return jsonify({
-        "id": room.id,
-        "number": room.number,
-        "room_type": room.room_type,
-        "status": room.status,
-        "capacity": room.capacity,
-        "beds": room.beds
+        "id": r.id,
+        "number": r.number,
+        "room_type": r.room_type,
+        "status": r.status,
+        "capacity": r.capacity,
+        "beds": r.beds,
+        "current_guest_name": active_booking.guest.full_name if active_booking and active_booking.guest else None,
+        "current_guest_phone": active_booking.guest.phone_number if active_booking and active_booking.guest else None
     }), 200
 
 
@@ -186,7 +197,6 @@ def get_room(room_id):
 def update_room_status(room_id):
     room = Room.query.get_or_404(room_id)
     data = request.json
-    # Expected statuses: Available | Occupied | Cleaning
     room.status = data.get("status", room.status)
     db.session.commit()
     return jsonify({"message": f"Room {room.number} status updated to {room.status}"}), 200
@@ -327,8 +337,7 @@ def delete_guest(guest_id):
     db.session.commit()
     return jsonify({"message": "Guest deleted"}), 200
 # ---------------------
-# BOOKINGS (Linking Guests to Rooms)
-# ---------------------
+# --- BOOKINGS LOGIC (Linking Guests to Rooms) ---
 
 def is_room_available(room_id, checkin_date, days_staying):
     """Checks if a room is available for the given date range"""
@@ -336,13 +345,12 @@ def is_room_available(room_id, checkin_date, days_staying):
     checkout = checkin + timedelta(days=days_staying)
     bookings = Booking.query.filter_by(room_id=room_id).all()
     for b in bookings:
-        # Use existing checkin_time and calculate checkout if not set
         b_checkin = b.checkin_time
+        # Use existing checkout_time or calculate based on days staying
         b_checkout = b.checkout_time or (b.checkin_time + timedelta(days=b.days_staying))
         if not (checkout <= b_checkin or checkin >= b_checkout):
             return False
     return True
-
 
 @routes.route("/bookings", methods=["POST"])
 def create_booking():
@@ -355,9 +363,9 @@ def create_booking():
     if not days_staying or days_staying <= 0:
         return jsonify({"error": "Invalid days_staying"}), 400
 
-    # Ensure the room is physically 'Available' before booking
+    # Safety check: Only 'Available' rooms can be booked
     if room.status != "Available":
-        return jsonify({"error": f"Room {room.number} is currently {room.status} and cannot be booked"}), 400
+        return jsonify({"error": f"Room {room.number} is {room.status} and cannot be booked"}), 400
 
     if not is_room_available(room.id, checkin_date, days_staying):
         return jsonify({"error": "Room not available for selected dates"}), 400
@@ -371,13 +379,46 @@ def create_booking():
         checkin_time=datetime.strptime(checkin_date, "%Y-%m-%d")
     )
     
-    # AUTO-FLIP: Mark room as Occupied upon booking
+    # AUTO-FLIP: Room becomes Occupied upon check-in
     room.status = "Occupied"
 
     db.session.add(booking)
     db.session.commit()
     return jsonify({"message": "Booking created", "id": booking.id, "room_status": room.status}), 201
 
+@routes.route("/bookings/<int:booking_id>/checkout", methods=["PUT"])
+def checkout(booking_id):
+    """Handles guest checkout and flips room status to Cleaning"""
+    b = Booking.query.get_or_404(booking_id)
+    
+    if b.checkout_time is not None:
+        return jsonify({"error": "Already checked out"}), 400
+    
+    now = datetime.utcnow()
+    b.checkout_time = now
+    
+    # Update Guest table string field for dashboard consistency
+    if b.guest:
+        b.guest.check_out = now.isoformat()
+    
+    # AUTO-FLIP: Room status to Cleaning (This triggers the blue card in Flutter)
+    if b.room:
+        b.room.status = "Cleaning"
+        print(f"DEBUG: Room {b.room.number} status updated to: {b.room.status}")
+    else:
+        # Fallback if relationship fails
+        room = Room.query.get(b.room_id)
+        if room:
+            room.status = "Cleaning"
+            print(f"DEBUG: Manual Room lookup success: {room.number} is Cleaning")
+
+    db.session.commit()
+    
+    return jsonify({
+        "message": "Checked out successfully", 
+        "room_status": "Cleaning",
+        "checkout_time": now.isoformat()
+    }), 200
 
 @routes.route("/bookings", methods=["GET"])
 def get_bookings():
@@ -396,57 +437,12 @@ def get_bookings():
         for b in bookings
     ]), 200
 
-
-@routes.route("/bookings/<int:booking_id>", methods=["GET"])
-def get_booking(booking_id):
-    b = Booking.query.get_or_404(booking_id)
-    return jsonify({
-        "id": b.id,
-        "guest": b.guest.full_name,
-        "room": b.room.number,
-        "checkin_time": b.checkin_time.isoformat() if b.checkin_time else None,
-        "checkout_time": b.checkout_time.isoformat() if b.checkout_time else None,
-        "days_staying": b.days_staying,
-        "paid": b.paid,
-        "amount_paid": b.amount_paid
-    }), 200
-
-
-@routes.route("/bookings/<int:booking_id>", methods=["PUT"])
-def update_booking(booking_id):
-    b = Booking.query.get_or_404(booking_id)
-    data = request.json
-    b.days_staying = data.get("days_staying", b.days_staying)
-    b.paid = data.get("paid", b.paid)
-    b.amount_paid = data.get("amount_paid", b.amount_paid)
-    db.session.commit()
-    return jsonify({"message": "Booking updated"}), 200
-
-
 @routes.route("/bookings/<int:booking_id>", methods=["DELETE"])
 def delete_booking(booking_id):
     b = Booking.query.get_or_404(booking_id)
-    # Reset room to Available if the booking is deleted
-    b.room.status = "Available"
+    # Reset room to Available if a booking is deleted manually
+    if b.room:
+        b.room.status = "Available"
     db.session.delete(b)
     db.session.commit()
     return jsonify({"message": "Booking deleted", "room_status": "Available"}), 200
-
-
-@routes.route("/bookings/<int:booking_id>/checkout", methods=["PUT"])
-def checkout(booking_id):
-    b = Booking.query.get_or_404(booking_id)
-    if b.checkout_time is not None:
-        return jsonify({"error": "Already checked out"}), 400
-    
-    b.checkout_time = datetime.utcnow()
-    
-    # AUTO-FLIP: Set room to Cleaning after a guest leaves
-    b.room.status = "Cleaning"
-    
-    db.session.commit()
-    return jsonify({
-        "message": "Checked out successfully", 
-        "checkout_time": b.checkout_time.isoformat(),
-        "room_status": "Cleaning"
-    }), 200
